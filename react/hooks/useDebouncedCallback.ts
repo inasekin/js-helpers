@@ -1,0 +1,217 @@
+import { useEffect, useMemo, useRef } from 'react';
+
+export interface CallOptions {
+    /**
+     * Controls if the function should be invoked on the leading edge of the timeout.
+     */
+    leading?: boolean;
+    /**
+     * Controls if the function should be invoked on the trailing edge of the timeout.
+     */
+    trailing?: boolean;
+}
+
+export interface Options extends CallOptions {
+    /**
+     * The maximum time the given function is allowed to be delayed before it's invoked.
+     */
+    maxWait?: number;
+}
+
+export interface ControlFunctions {
+    /**
+     * Cancel pending function invocations.
+     */
+    cancel(): void;
+    /**
+     * Immediately invoke pending function invocations.
+     */
+    flush(): void;
+    /**
+     * Returns `true` if there are any pending function invocations.
+     */
+    isPending(): boolean;
+}
+
+/**
+ * Subsequent calls to the debounced function `debounced.callback` return the result of the last func invocation.
+ * Note, that if there are no previous invocations it's mean you will get undefined. You should check it in your code properly.
+ */
+export interface DebouncedState<T extends (...args: any[]) => ReturnType<T>> extends ControlFunctions {
+    (...args: Parameters<T>): ReturnType<T> | undefined;
+}
+
+export const useDebouncedCallback = <T extends (...args: any) => ReturnType<T>>(
+    func: T,
+    waiting?: number,
+    opts?: Options
+): DebouncedState<T> => {
+    const lastCallTime = useRef<number | null>(null);
+    const lastInvokeTime = useRef(0);
+    const timerId = useRef<NodeJS.Timeout | number | null>(null);
+    const lastArgs = useRef<unknown[] | null>([]);
+    const lastThis = useRef<unknown>();
+    const result = useRef<ReturnType<T>>();
+    const funcRef = useRef(func);
+    const mounted = useRef(true);
+
+    useEffect(() => {
+        funcRef.current = func;
+    }, [func]);
+
+    if (typeof func !== 'function') {
+        throw new TypeError('Expected a function');
+    }
+
+    const wait: number = +(waiting || 0);
+
+    const options: Options = opts || {};
+
+    // Bypass `requestAnimationFrame` by explicitly setting `wait=0`.
+    const useRAF = !wait && wait !== 0 && typeof window !== 'undefined';
+
+    const leading = !!options.leading;
+    const trailing = 'trailing' in options ? !!options.trailing : true; // `true` by default
+    const maxing = 'maxWait' in options;
+    const maxWait = maxing ? Math.max(+(options?.maxWait || 0), wait) : null;
+
+    useEffect(() => {
+        mounted.current = true;
+
+        return () => {
+            mounted.current = false;
+        };
+    }, []);
+
+    // You may have a question, why we have so many code under the useMemo definition.
+    //
+    // This was made as we want to escape from useCallback hell and
+    // not to initialize a number of functions each time useDebouncedCallback is called.
+    //
+    // It means that we have less garbage for our GC calls which improves performance.
+    // Also, it makes this library smaller.
+    //
+    // And the last reason, that the code without lots of useCallback with deps is easier to read.
+    // You have only one place for that.
+    return useMemo(() => {
+        const invokeFunc = (time: number) => {
+            const args = lastArgs.current;
+            const thisArg = lastThis.current;
+
+            lastArgs.current = null;
+            lastThis.current = null;
+            lastInvokeTime.current = time;
+
+            return (result.current = funcRef.current.apply(thisArg, args!));
+        };
+
+        const startTimer = (pendingFunc: () => void, waitPeriod: number) => {
+            if (useRAF) cancelAnimationFrame(timerId.current as number);
+
+            timerId.current = useRAF ? requestAnimationFrame(pendingFunc) : setTimeout(pendingFunc, waitPeriod);
+        };
+
+        const shouldInvoke = (time: number) => {
+            if (!mounted.current) return false;
+
+            const timeSinceLastCall = time - lastCallTime.current!;
+            const timeSinceLastInvoke = time - lastInvokeTime.current;
+
+            // Either this is the first call, activity has stopped and we're at the
+            // trailing edge, the system time has gone backwards and we're treating
+            // it as the trailing edge, or we've hit the `maxWait` limit.
+            return !lastCallTime.current || timeSinceLastCall >= wait || timeSinceLastCall < 0 || (maxing && timeSinceLastInvoke >= maxWait!);
+        };
+
+        const trailingEdge = (time: number) => {
+            timerId.current = null;
+
+            // Only invoke if we have `lastArgs` which means `func` has been
+            // debounced at least once.
+            if (trailing && lastArgs.current) {
+                return invokeFunc(time);
+            }
+
+            lastArgs.current = null;
+            lastThis.current = null;
+
+            return result.current;
+        };
+
+        const timerExpired = () => {
+            const time = Date.now();
+
+            if (shouldInvoke(time)) {
+                trailingEdge(time);
+
+                return;
+            }
+
+            // https://github.com/xnimorz/use-debounce/issues/97
+            if (!mounted.current) {
+                return;
+            }
+
+            // Remaining wait calculation
+            const timeSinceLastCall = time - lastCallTime.current!;
+            const timeSinceLastInvoke = time - lastInvokeTime.current;
+            const timeWaiting = wait - timeSinceLastCall;
+            const remainingWait = maxing ? Math.min(timeWaiting, maxWait! - timeSinceLastInvoke) : timeWaiting;
+
+            // Restart the timer
+            startTimer(timerExpired, remainingWait);
+        };
+
+        const debFunc: DebouncedState<T> = (...args: Parameters<T>): ReturnType<T> => {
+            const time = Date.now();
+            const isInvoking = shouldInvoke(time);
+
+            lastArgs.current = args;
+            lastThis.current = this;
+            lastCallTime.current = time;
+
+            if (isInvoking) {
+                if (!timerId.current && mounted.current) {
+                    // Reset any `maxWait` timer.
+                    lastInvokeTime.current = lastCallTime.current;
+                    // Start the timer for the trailing edge.
+                    startTimer(timerExpired, wait);
+
+                    // Invoke the leading edge.
+                    return leading ? invokeFunc(lastCallTime.current) : result.current!;
+                }
+
+                if (maxing) {
+                    // Handle invocations in a tight loop.
+                    startTimer(timerExpired, wait);
+
+                    return invokeFunc(lastCallTime.current);
+                }
+            }
+
+            if (!timerId.current) {
+                startTimer(timerExpired, wait);
+            }
+
+            return result.current!;
+        };
+
+        debFunc.cancel = () => {
+            if (timerId.current) {
+                useRAF ? cancelAnimationFrame(timerId.current as number) : clearTimeout(timerId.current as number | undefined);
+            }
+
+            lastInvokeTime.current = 0;
+            lastArgs.current = null;
+            lastCallTime.current = null;
+            lastThis.current = null;
+            timerId.current = null;
+        };
+
+        debFunc.isPending = () => !!timerId.current;
+
+        debFunc.flush = () => (timerId.current ? trailingEdge(Date.now()) : result.current);
+
+        return debFunc;
+    }, [leading, maxing, wait, maxWait, trailing, useRAF]);
+};
